@@ -1,25 +1,44 @@
-"""Reproduce four narrow resource examples with independent expected outputs."""
+"""Reproduce seven narrow resource examples with independent expected outputs."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
 from importlib.metadata import version
+import io
 import json
+import os
 from pathlib import Path
 import platform
 import struct
 import subprocess
+import sys
+import tarfile
 import tempfile
 from urllib.request import urlopen
 
 from construct import Byte, Bytes, Const, ConstructError, Int16ul, Struct, Terminated
 from scapy.all import Ether, IP, Raw, UDP, rdpcap, wrpcap
 import yara_x
+from malduck.extractor import ExtractManager, ExtractorModules
 
 SOURCE = Path(__file__).resolve().parent
 JAR_URL = "https://github.com/Vineflower/vineflower/releases/download/1.12.0/vineflower-1.12.0.jar"
 JAR_SHA256 = "1dfcfe974395734fa467ce620661c7623d05ba83670de0529b1fbd63ff548b9d"
 GOLDEN = bytes.fromhex("534d4b310500017472616365")
 EXPECTED_BRANCHES = "-1:-1\n0:11\n1:22\n2:22\n9:-1"
+DUCK_KEY = b"duck-key"
+DUCK_PLAIN = b"c2=http://192.0.2.10/gate;c2=http://198.51.100.7/gate;campaign=trace-7;sleep=300"
+DUCK_CONFIG = {"family": "duckcfg", "urls": ["http://192.0.2.10/gate", "http://198.51.100.7/gate"], "campaign": "trace-7", "sleep": 300}
+HERMESC = {
+    98: ("https://registry.npmjs.org/hermes-compiler/-/hermes-compiler-250829098.0.19.tgz",
+         "839af099f0926b5ebbd738ba54764a3f40e35dfc3aac91babf56f8eb7c69280e"),
+    99: ("https://registry.npmjs.org/hermes-compiler/-/hermes-compiler-260318099.0.4.tgz",
+         "613b6230cf796bd1b6a8248e2cf8fb2799a5be92d23d49e96ee0b68dc2bfdcf2"),
+}
+HBC_ORIGINAL_OUTPUT = "even:negative:25"
+HBC_PSEUDOCODE_OUTPUT = "even:negative:21"
+MEMPROCFS_HOST = platform.system() == "Linux" and platform.machine() == "x86_64"
+PML4, PDPT, PD, PT, PAGE = 0x10000, 0x11000, 0x12000, 0x13000, 0x345000
+FIXTURE_VA = 0x140001678
 
 
 def sha256(path):
@@ -36,13 +55,118 @@ def checksum(data):
     return (~total) & 0xFFFF
 
 
-def run(*args):
-    completed = subprocess.run(args, text=True, capture_output=True, check=True)
+def run(*args, env=None):
+    completed = subprocess.run(args, text=True, capture_output=True, check=True, env=env)
     return completed.stdout.strip()
 
 
+def rc4(key, data):
+    """Independent RC4 used only to build the Malduck fixture."""
+    state, j = list(range(256)), 0
+    for i in range(256):
+        j = (j + state[i] + key[i % len(key)]) & 0xFF
+        state[i], state[j] = state[j], state[i]
+    i = j = 0
+    out = bytearray()
+    for byte in data:
+        i = (i + 1) & 0xFF
+        j = (j + state[i]) & 0xFF
+        state[i], state[j] = state[j], state[i]
+        out.append(byte ^ state[(state[i] + state[j]) & 0xFF])
+    return bytes(out)
+
+
+def duck_sample(key=DUCK_KEY, marker=b"DKCFG1"):
+    return b"\x00" * 64 + marker + DUCK_KEY + struct.pack("<H", len(DUCK_PLAIN)) + rc4(key, DUCK_PLAIN) + b"\x00" * 32
+
+
+def verify_malduck(work):
+    modules = ExtractorModules(str(SOURCE / "malduck_modules"))
+    results = {}
+    for name, data in {"good": duck_sample(), "wrong-key": duck_sample(key=b"bad-key!"), "no-marker": duck_sample(marker=b"XXXXXX")}.items():
+        path = work / f"duckcfg-{name}.bin"
+        path.write_bytes(data)
+        manager = ExtractManager(modules)
+        results[name] = (manager.push_file(str(path)), manager.config)
+    assert results["good"] == ("duckcfg", [DUCK_CONFIG]), results["good"]
+    assert results["wrong-key"] == (None, []) and results["no-marker"] == (None, [])
+    return sha256(work / "duckcfg-good.bin")
+
+
+def hermesc(work, bytecode_version):
+    url, digest = HERMESC[bytecode_version]
+    with urlopen(url, timeout=120) as response:
+        archive = response.read()
+    assert hashlib.sha256(archive).hexdigest() == digest, f"hermes-compiler {bytecode_version} digest mismatch"
+    member = {"Linux": "package/hermesc/linux64-bin/hermesc", "Darwin": "package/hermesc/osx-bin/hermesc"}[platform.system()]
+    target = work / f"hermesc-{bytecode_version}"
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        target.write_bytes(tar.extractfile(member).read())
+    target.chmod(0o755)
+    return target
+
+
+def verify_hermes_dec(work):
+    tools = Path(sys.executable).parent
+    shim = "globalThis.print = console.log; new Function(require('fs').readFileSync(process.argv[1], 'utf8'))();"
+    assert run("node", "-e", shim, str(SOURCE / "hbc_fixture.js")) == HBC_ORIGINAL_OUTPUT
+    digests = {}
+    for bytecode_version in HERMESC:
+        compiler = hermesc(work, bytecode_version)
+        bare, hbc, hasm, pseudo = [work / f"fixture-{bytecode_version}{ext}" for ext in ("-g0.hbc", "-g1.hbc", ".hasm", ".js")]
+        for level, output in (("-g0", bare), ("-g1", hbc)):
+            run(str(compiler), "-emit-binary", level, "-out", str(output), str(SOURCE / "hbc_fixture.js"))
+            assert output.read_bytes()[8] == bytecode_version, "Unexpected HBC header version"
+        parsed = subprocess.run([str(tools / "hbc-file-parser"), str(bare)], text=True, capture_output=True, check=True)
+        assert f"| Version                      | {bytecode_version}" in parsed.stdout
+        assert "not formally supported" in parsed.stderr
+        # With backtrace location info (-g1), the header prints but debug-info parsing raises a TypeError.
+        parsed = subprocess.run([str(tools / "hbc-file-parser"), str(hbc)], text=True, capture_output=True)
+        assert parsed.returncode == 1 and f"| Version                      | {bytecode_version}" in parsed.stdout
+        assert "debug_info_parser.py" in parsed.stderr and "TypeError" in parsed.stderr
+        run(str(tools / "hbc-disassembler"), str(hbc), str(hasm))
+        run(str(tools / "hbc-decompiler"), str(hbc), str(pseudo))
+        listing, code = hasm.read_text(), pseudo.read_text()
+        for needle in ('Function #1 "classify"', 'Function #2 "scaled"', "<Mod>", "'hbc-fixture-marker'"):
+            assert needle in listing, needle
+        for needle in ("// Original name: classify", "// Original name: scaled", "'negative'", "'zero'", "'even'", "'odd'", "r0 = 7;"):
+            assert needle in code, needle
+        # The pseudo-code shares register variables across functions, so running it does not reproduce the original.
+        assert run("node", "-e", shim, str(pseudo)) == HBC_PSEUDOCODE_OUTPUT
+        digests[bytecode_version] = {"g0": sha256(bare), "g1": sha256(hbc)}
+    return digests
+
+
+def memprocfs_image(path):
+    image = bytearray(16 * 1024 * 1024)
+    indexes = [(FIXTURE_VA >> shift) & 0x1FF for shift in (39, 30, 21, 12)]
+    for table, entry, index in zip((PML4, PDPT, PD, PT), (PDPT, PD, PT, PAGE), indexes):
+        image[table + index * 8:table + index * 8 + 8] = struct.pack("<Q", entry | 0x7)
+    image[0x1000:0x1010] = b"MPFS-PHYS-MARK-1"
+    image[PAGE + 0x678:PAGE + 0x688] = b"MPFS-VIRT-MARK-2"
+    path.write_bytes(image)
+
+
+def verify_memprocfs(work):
+    import leechcorepyc
+
+    image = work / "memprocfs.raw"
+    memprocfs_image(image)
+    env = dict(os.environ, LD_LIBRARY_PATH=str(Path(leechcorepyc.__file__).parent))
+    output = run(sys.executable, str(SOURCE / "memprocfs_probe.py"), str(image), hex(PML4), hex(FIXTURE_VA), env=env)
+    observed = json.loads(output.splitlines()[-1])
+    assert bytes.fromhex(observed["physical"]) == b"MPFS-PHYS-MARK-1" == bytes.fromhex(observed["pmem_file"])
+    assert observed["processes"] == [[1, "unknown_process", PML4]], observed["processes"]
+    assert bytes.fromhex(observed["virtual"]) == b"MPFS-VIRT-MARK-2" and observed["virt2phys"] == PAGE + 0x678
+    assert "memory.pmem" in observed["root"]
+    return sha256(image)
+
+
 def verify(work, jar):
-    for package, expected in {"construct": "2.10.70", "scapy": "2.8.0", "yara-x": "1.21.0"}.items():
+    expected_versions = {"construct": "2.10.70", "scapy": "2.8.0", "yara-x": "1.21.0", "malduck": "4.4.1", "hermes-dec": "0.1.8"}
+    if MEMPROCFS_HOST:
+        expected_versions.update({"memprocfs": "5.19.0", "leechcorepyc": "2.23.3"})
+    for package, expected in expected_versions.items():
         assert version(package) == expected, f"Unexpected {package} version"
 
     schema = Struct(
@@ -104,19 +228,37 @@ def verify(work, jar):
         assert run("java", "-cp", str(classes), "BranchDemo") == "25"
         assert run("java", "-cp", str(classes), "Probe") == EXPECTED_BRANCHES
 
+    duck_digest = verify_malduck(work)
+    hbc_digests = verify_hermes_dec(work)
+    memprocfs = {"name": "MemProcFS", "version": "5.19.0", "result": "skipped", "scope": "The pinned wheel is Linux x86_64 only"}
+    image_digest = None
+    if MEMPROCFS_HOST:
+        image_digest = verify_memprocfs(work)
+        memprocfs.update(result="passed", scope="Self-authored raw image: physical read, user-supplied DTB fallback process, virtual read, virt2phys, /memory.pmem; no Windows OS analysis")
+
     return {
         "checked_at": datetime.now(timezone.utc).isoformat(),
-        "host": {"platform": platform.platform(), "python": platform.python_version(), "javac": run("javac", "-version")},
+        "host": {"platform": platform.platform(), "python": platform.python_version(), "javac": run("javac", "-version"), "node": run("node", "--version")},
         "results": [
             {"name": "Construct", "version": "2.10.70", "result": "passed", "scope": "Golden bytes, parse/build, wrong magic, truncation, trailing-data rejection"},
             {"name": "Scapy", "version": "2.8.0", "result": "passed", "scope": "Offline packet/PCAP round trip and independent IP/UDP checksums; no traffic sent"},
             {"name": "YARA-X", "version": "1.21.0", "result": "passed", "scope": "Python API positive/negative matching and strict-regex CompileError"},
             {"name": "Vineflower", "version": "1.12.0", "result": "passed", "scope": "Java 17 record/switch expression, rebuild, main output and five branch vectors"},
+            {"name": "Malduck", "version": "4.4.1", "result": "passed", "scope": "Self-authored YARA-triggered extractor and RC4 config; wrong-key and no-marker samples yield no config"},
+            {"name": "hermes-dec", "version": "0.1.8", "result": "passed", "scope": "HBC 98/99 at -g0/-g1: header, disassembly and pseudo-code landmarks; -g1 debug-info parsing raises TypeError; executing the pseudo-code prints 21, not 25"},
+            memprocfs,
         ],
-        "inputs": [{"path": name, "sha256": sha256(SOURCE / name)} for name in ("BranchDemo.java", "Probe.java", "verify.py", "requirements.txt")],
+        "inputs": [{"path": name, "sha256": sha256(SOURCE / name)} for name in (
+            "BranchDemo.java", "Probe.java", "hbc_fixture.js", "malduck_modules/duckcfg/__init__.py",
+            "malduck_modules/duckcfg/duckcfg.yar", "memprocfs_probe.py", "verify.py", "requirements.txt")],
         "golden_hex": GOLDEN.hex(),
         "vineflower_artifact": {"url": JAR_URL, "sha256": JAR_SHA256},
         "expected_main": "25", "expected_branches": EXPECTED_BRANCHES.splitlines(),
+        "malduck": {"sample_sha256": duck_digest, "expected_config": DUCK_CONFIG},
+        "hermes_dec": {"compilers": {str(v): {"url": u, "sha256": d} for v, (u, d) in HERMESC.items()},
+                       "hbc_sha256": {str(v): d for v, d in hbc_digests.items()},
+                       "original_output": HBC_ORIGINAL_OUTPUT, "pseudocode_output": HBC_PSEUDOCODE_OUTPUT},
+        "memprocfs": {"image_sha256": image_digest, "dtb": hex(PML4), "virtual_address": hex(FIXTURE_VA), "physical_address": hex(PAGE + 0x678)},
     }
 
 
